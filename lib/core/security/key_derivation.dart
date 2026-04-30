@@ -1,183 +1,165 @@
+// lib/core/security/key_derivation.dart
+// PRODUCTION — Argon2id key derivation with static API, isolate-based.
+
 import 'dart:convert';
 import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:argon2/argon2.dart';
-import 'package:safira/core/constants/app_constants.dart';
-import 'package:safira/core/errors/exceptions.dart';
-import 'package:safira/core/security/crypto_engine.dart';
+
+import '../constants/app_constants.dart';
+import '../errors/exceptions.dart';
+import 'crypto_engine.dart';
+
+// ─── DerivedKeyBundle ────────────────────────────────────────────────────────
+
+/// Material from a single key-derivation call.
+class DerivedKeyBundle {
+  final Uint8List derivedKey; // 32-byte AES-256 key — keep in memory only
+  final Uint8List salt;       // Argon2id salt — safe to persist
+
+  const DerivedKeyBundle({required this.derivedKey, required this.salt});
+
+  /// Zero derived key from memory (call after handing it to SessionManager).
+  void zero() => CryptoEngine.zeroMemory(derivedKey);
+}
+
+// ─── KeyDerivation ───────────────────────────────────────────────────────────
 
 /// Argon2id-based key derivation for Safira.
 ///
-/// Argon2id is the winner of the Password Hashing Competition (PHC) and
-/// is recommended by OWASP, NIST, and RFC 9106 for password hashing.
-///
 /// Why Argon2id over PBKDF2/bcrypt:
-/// - Memory-hard: GPU/ASIC attacks are extremely expensive
-/// - Side-channel resistant (hybrid of Argon2i + Argon2d)
-/// - Configurable memory, time, and parallelism costs
+/// - Memory-hard → GPU/ASIC attacks extremely expensive.
+/// - Hybrid of Argon2i (side-channel-resistant) + Argon2d (TMTO-resistant).
+/// - Recommended by OWASP, NIST SP 800-132, RFC 9106.
 ///
-/// Parameters used (OWASP recommended minimums exceeded):
-/// - Memory: 64 MB
-/// - Iterations: 3
+/// Default parameters exceed OWASP-recommended minimums:
+/// - Memory   : 64 MiB  (OWASP min: 19 MiB)
+/// - Iterations: 3      (OWASP min: 1)
 /// - Parallelism: 4
-/// - Output length: 32 bytes (256-bit AES key)
-final class KeyDerivation {
+/// - Output   : 32 bytes (256-bit)
+abstract final class KeyDerivation {
   KeyDerivation._();
 
-  static final KeyDerivation instance = KeyDerivation._();
+  // ── New vault: generate fresh salt + derive key ───────────────────────
 
-  /// Derives a 256-bit encryption key from [masterPassword] and [salt].
-  ///
-  /// This is a CPU and memory intensive operation — always call in an isolate
-  /// to avoid blocking the UI thread.
-  ///
-  /// Returns the derived key as a [Uint8List].
-  Future<Uint8List> deriveKey({
-    required String masterPassword,
-    required Uint8List salt,
+  /// Derives a 256-bit AES key from [password] using a freshly generated
+  /// random salt. Use when **creating** a new vault.
+  static Future<DerivedKeyBundle> deriveKey({
+    required String password,
+    int memoryKiB = CryptoConstants.argon2MemoryKiB,
+    int iterations = CryptoConstants.argon2Iterations,
+    int parallelism = CryptoConstants.argon2Parallelism,
   }) async {
-    _validatePassword(masterPassword);
-
-    // Run Argon2id in an isolate to avoid blocking the UI thread
-    return Isolate.run(
-      () => _deriveKeySync(masterPassword, salt),
+    _validate(password);
+    final salt =
+        CryptoEngine.generateRandomBytes(CryptoConstants.argon2SaltLength);
+    final key = await _runInIsolate(
+      _IsolateArgs(
+        password: password,
+        salt: salt,
+        memoryKiB: memoryKiB,
+        iterations: iterations,
+        parallelism: parallelism,
+      ),
     );
+    return DerivedKeyBundle(derivedKey: key, salt: salt);
   }
 
-  /// Derives both an encryption key and a verification hash from the master password.
-  ///
-  /// Uses separate salts for key derivation and verification hash to ensure
-  /// they are cryptographically independent.
-  Future<DerivedKeyBundle> deriveKeyBundle({
-    required String masterPassword,
-  }) async {
-    _validatePassword(masterPassword);
+  // ── Unlock: re-derive from stored salt ───────────────────────────────
 
-    final keySalt = CryptoEngine.generateRandomBytes(CryptoConstants.argon2SaltLength);
-    final verificationSalt = CryptoEngine.generateRandomBytes(CryptoConstants.argon2SaltLength);
-
-    final results = await Future.wait([
-      deriveKey(masterPassword: masterPassword, salt: keySalt),
-      _deriveVerificationHash(masterPassword: masterPassword, salt: verificationSalt),
-    ]);
-
-    return DerivedKeyBundle(
-      encryptionKey: results[0],
-      keySalt: keySalt,
-      verificationHash: results[1],
-      verificationSalt: verificationSalt,
-    );
-  }
-
-  /// Verifies that [masterPassword] matches the stored [verificationHash].
-  ///
-  /// Uses constant-time comparison to prevent timing attacks.
-  Future<bool> verifyPassword({
-    required String masterPassword,
-    required Uint8List verificationHash,
-    required Uint8List verificationSalt,
-  }) async {
-    try {
-      _validatePassword(masterPassword);
-
-      final candidateHash = await _deriveVerificationHash(
-        masterPassword: masterPassword,
-        salt: verificationSalt,
-      );
-
-      return CryptoEngine.constantTimeEquals(candidateHash, verificationHash);
-    } on AuthException {
-      rethrow;
-    } on Object catch (e) {
-      throw AuthException(
-        message: 'Password verification failed',
-        cause: e,
-      );
-    }
-  }
-
-  /// Re-derives the encryption key from password + stored salt (for unlock).
-  Future<Uint8List> rederiveKey({
-    required String masterPassword,
-    required Uint8List keySalt,
-  }) =>
-      deriveKey(masterPassword: masterPassword, salt: keySalt);
-
-  // ─── Private ──────────────────────────────────────────────────────────────
-
-  static Uint8List _deriveKeySync(String password, Uint8List salt) {
-    try {
-      final parameters = Argon2Parameters(
-        Argon2Parameters.ARGON2_id,
-        salt,
-        version: Argon2Parameters.ARGON2_VERSION_13,
-        iterations: CryptoConstants.argon2Iterations,
-        memoryPowerOf2: 16, // 2^16 = 65536 KB = 64 MB
-        lanes: CryptoConstants.argon2Parallelism,
-        desiredKeyLength: CryptoConstants.argon2KeyLength,
-      );
-
-      final generator = Argon2BytesGenerator()..init(parameters);
-      final passwordBytes = Uint8List.fromList(utf8.encode(password));
-      final result = Uint8List(CryptoConstants.argon2KeyLength);
-      generator.generateBytes(passwordBytes, result);
-
-      // Zero out password bytes from memory
-      CryptoEngine.zeroMemory(passwordBytes);
-
-      return result;
-    } on Object catch (e) {
-      throw CryptoException(
-        message: 'Argon2id key derivation failed',
-        cause: e,
-      );
-    }
-  }
-
-  Future<Uint8List> _deriveVerificationHash({
-    required String masterPassword,
+  /// Re-derives the AES key using a **previously stored** [salt].
+  /// Use when **unlocking** an existing vault.
+  static Future<DerivedKeyBundle> deriveKeyFromSalt({
+    required String password,
     required Uint8List salt,
-  }) =>
-      Isolate.run(() => _deriveKeySync(masterPassword, salt));
+    int memoryKiB = CryptoConstants.argon2MemoryKiB,
+    int iterations = CryptoConstants.argon2Iterations,
+    int parallelism = CryptoConstants.argon2Parallelism,
+  }) async {
+    _validate(password);
+    final key = await _runInIsolate(
+      _IsolateArgs(
+        password: password,
+        salt: salt,
+        memoryKiB: memoryKiB,
+        iterations: iterations,
+        parallelism: parallelism,
+      ),
+    );
+    return DerivedKeyBundle(derivedKey: key, salt: salt);
+  }
 
-  void _validatePassword(String password) {
-    if (password.length < CryptoConstants.argon2KeyLength ~/ 4) {
-      throw AuthException(
-        message: 'Master password too short',
-      );
+  // ── Private ───────────────────────────────────────────────────────────
+
+  static void _validate(String password) {
+    if (password.isEmpty) {
+      throw const AuthException(message: 'Password cannot be empty.');
     }
     if (password.length > SecurityConstants.maxMasterPasswordLength) {
       throw AuthException(
-        message: 'Master password too long (max ${SecurityConstants.maxMasterPasswordLength} chars)',
+        message:
+            'Password too long (max ${SecurityConstants.maxMasterPasswordLength} chars).',
       );
     }
   }
+
+  static Future<Uint8List> _runInIsolate(_IsolateArgs args) =>
+      Isolate.run(() => _deriveSync(args));
+
+  static Uint8List _deriveSync(_IsolateArgs args) {
+    try {
+      final parameters = Argon2Parameters(
+        Argon2Parameters.ARGON2_id,
+        args.salt,
+        version: Argon2Parameters.ARGON2_VERSION_13,
+        iterations: args.iterations,
+        memoryPowerOf2: _memKiBToPower(args.memoryKiB),
+        lanes: args.parallelism,
+        desiredKeyLength: CryptoConstants.argon2KeyLength,
+      );
+
+      final gen = Argon2BytesGenerator()..init(parameters);
+      final pwBytes = Uint8List.fromList(utf8.encode(args.password));
+      final out = Uint8List(CryptoConstants.argon2KeyLength);
+      gen.generateBytes(pwBytes, out);
+
+      // Zero password bytes from isolate memory.
+      CryptoEngine.zeroMemory(pwBytes);
+
+      return out;
+    } on Object catch (e) {
+      throw CryptoException(message: 'Argon2id failed: $e', cause: e);
+    }
+  }
+
+  /// Converts a KiB value to the nearest power-of-2 exponent.
+  static int _memKiBToPower(int kib) {
+    if (kib <= 0) return 16; // default: 2^16 = 65536 KiB = 64 MiB
+    var p = 0;
+    var v = kib;
+    while (v > 1) {
+      v >>= 1;
+      p++;
+    }
+    return p;
+  }
 }
 
-/// Bundle containing all derived key material for a new vault.
-final class DerivedKeyBundle {
-  const DerivedKeyBundle({
-    required this.encryptionKey,
-    required this.keySalt,
-    required this.verificationHash,
-    required this.verificationSalt,
+// ─── Internal args record ─────────────────────────────────────────────────────
+
+class _IsolateArgs {
+  final String password;
+  final Uint8List salt;
+  final int memoryKiB;
+  final int iterations;
+  final int parallelism;
+
+  const _IsolateArgs({
+    required this.password,
+    required this.salt,
+    required this.memoryKiB,
+    required this.iterations,
+    required this.parallelism,
   });
-
-  /// The AES-256 encryption key (keep in memory only, never persist)
-  final Uint8List encryptionKey;
-
-  /// Salt used to derive [encryptionKey] (safe to store)
-  final Uint8List keySalt;
-
-  /// Hash used to verify master password (safe to store)
-  final Uint8List verificationHash;
-
-  /// Salt used to derive [verificationHash] (safe to store)
-  final Uint8List verificationSalt;
-
-  /// Zeros out the encryption key in memory.
-  void dispose() {
-    CryptoEngine.zeroMemory(encryptionKey);
-  }
 }
