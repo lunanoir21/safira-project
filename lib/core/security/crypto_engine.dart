@@ -1,20 +1,95 @@
+// lib/core/security/crypto_engine.dart
+// PRODUCTION — AES-256-GCM with static API + storage serialisation helpers.
+
+import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:cryptography/cryptography.dart';
-import 'package:safira/core/constants/app_constants.dart';
-import 'package:safira/core/errors/exceptions.dart';
 
-/// Core cryptographic engine for Safira.
+import '../constants/app_constants.dart';
+import '../errors/exceptions.dart';
+
+// ─── EncryptedPayload ────────────────────────────────────────────────────────
+
+/// Immutable container for AES-GCM encrypted output.
 ///
-/// Provides AES-256-GCM authenticated encryption and decryption.
-/// All methods are stateless and pure — no side effects.
+/// Binary layout (toBytes / fromBytes):
+///   [nonce 12 B] [tag 16 B] [ciphertext N B]
+///
+/// String layout (toStorageString / fromStorageString):
+///   "&lt;nonce_b64&gt;:&lt;tag_b64&gt;:&lt;ciphertext_b64&gt;"
+///   Used for plain-text Isar fields such as encryptedSentinel.
+final class EncryptedPayload {
+  final Uint8List nonce;
+  final Uint8List tag;
+  final Uint8List ciphertext;
+
+  const EncryptedPayload({
+    required this.nonce,
+    required this.tag,
+    required this.ciphertext,
+  });
+
+  // Alias: `mac` == `tag` for backward compatibility with existing code.
+  Uint8List get mac => tag;
+
+  // ── Binary serialisation ─────────────────────────────────────────────
+
+  factory EncryptedPayload.fromBytes(Uint8List bytes) {
+    const nl = CryptoConstants.aesNonceLength;
+    const tl = CryptoConstants.aesTagLength;
+    if (bytes.length < nl + tl) {
+      throw const CryptoException(message: 'Payload too short');
+    }
+    return EncryptedPayload(
+      nonce: bytes.sublist(0, nl),
+      tag: bytes.sublist(nl, nl + tl),
+      ciphertext: bytes.sublist(nl + tl),
+    );
+  }
+
+  Uint8List toBytes() {
+    final out = Uint8List(nonce.length + tag.length + ciphertext.length);
+    var o = 0;
+    out.setRange(o, o + nonce.length, nonce);
+    o += nonce.length;
+    out.setRange(o, o + tag.length, tag);
+    o += tag.length;
+    out.setRange(o, o + ciphertext.length, ciphertext);
+    return out;
+  }
+
+  // ── String serialisation (for Isar text fields) ──────────────────────
+
+  /// Encodes as "&lt;nonce_b64&gt;:&lt;tag_b64&gt;:&lt;ciphertext_b64&gt;".
+  String toStorageString() =>
+      '${base64.encode(nonce)}:${base64.encode(tag)}:${base64.encode(ciphertext)}';
+
+  factory EncryptedPayload.fromStorageString(String s) {
+    final parts = s.split(':');
+    if (parts.length != 3) {
+      throw const CryptoException(message: 'Invalid storage string format');
+    }
+    return EncryptedPayload(
+      nonce: base64.decode(parts[0]),
+      tag: base64.decode(parts[1]),
+      ciphertext: base64.decode(parts[2]),
+    );
+  }
+}
+
+// ─── CryptoEngine ────────────────────────────────────────────────────────────
+
+/// Stateless AES-256-GCM encryption/decryption engine.
 ///
 /// Security properties:
-/// - AES-256-GCM provides both confidentiality and authenticity
-/// - Unique random nonce per encryption operation (prevents nonce reuse)
-/// - Authentication tag (128-bit) detects any tampering
-/// - No key material is ever stored — keys live only in memory
+/// - Unique random nonce (12 B) per encryption — nonce reuse is catastrophic.
+/// - 128-bit authentication tag — any tampering causes MAC failure.
+/// - Keys never persisted — only live in SessionManager's locked memory.
+///
+/// All methods are available as **static calls**.
+/// The [instance] singleton is kept for backward compatibility.
 final class CryptoEngine {
   CryptoEngine._();
 
@@ -23,168 +98,83 @@ final class CryptoEngine {
   static final _algorithm = AesGcm.with256bits(
     nonceLength: CryptoConstants.aesNonceLength,
   );
+  static final _rng = Random.secure();
 
-  static final _secureRandom = Random.secure();
+  // ── Encrypt ───────────────────────────────────────────────────────────
 
-  /// Encrypts [plaintext] bytes using [key] with AES-256-GCM.
-  ///
-  /// Returns a [EncryptedPayload] containing the ciphertext, nonce, and MAC.
-  /// Each call generates a new random nonce — NEVER reuse nonces.
-  ///
-  /// Throws [CryptoException] on failure.
-  Future<EncryptedPayload> encrypt({
+  /// Encrypts [plaintext] with AES-256-GCM using [key].
+  /// A fresh random nonce is generated for every call.
+  static Future<EncryptedPayload> encrypt({
     required Uint8List plaintext,
     required Uint8List key,
     Uint8List? associatedData,
   }) async {
     try {
-      final secretKey = SecretKey(key);
-      final nonce = _generateNonce();
-
-      final secretBox = await _algorithm.encrypt(
+      final nonce = generateRandomBytes(CryptoConstants.aesNonceLength);
+      final box = await _algorithm.encrypt(
         plaintext,
-        secretKey: secretKey,
+        secretKey: SecretKey(key),
         nonce: nonce,
         aad: associatedData ?? Uint8List(0),
       );
-
       return EncryptedPayload(
-        ciphertext: Uint8List.fromList(secretBox.cipherText),
         nonce: Uint8List.fromList(nonce),
-        mac: Uint8List.fromList(secretBox.mac.bytes),
+        tag: Uint8List.fromList(box.mac.bytes),
+        ciphertext: Uint8List.fromList(box.cipherText),
       );
-    } on Object catch (e, st) {
-      throw CryptoException(
-        message: 'AES-256-GCM encryption failed',
-        cause: e,
-      );
+    } on Object catch (e) {
+      throw CryptoException(message: 'Encryption failed: $e', cause: e);
     }
   }
 
-  /// Decrypts [payload] using [key] with AES-256-GCM.
-  ///
-  /// Verifies the authentication tag before returning plaintext.
-  /// Returns null if authentication fails (wrong key or tampered data).
-  ///
-  /// Throws [CryptoException] on failure.
-  Future<Uint8List?> decrypt({
+  // ── Decrypt ───────────────────────────────────────────────────────────
+
+  /// Decrypts [payload] with AES-256-GCM using [key].
+  /// Throws [CryptoException] if MAC verification fails.
+  static Future<Uint8List> decrypt({
     required EncryptedPayload payload,
     required Uint8List key,
     Uint8List? associatedData,
   }) async {
     try {
-      final secretKey = SecretKey(key);
-      final secretBox = SecretBox(
+      final box = SecretBox(
         payload.ciphertext,
         nonce: payload.nonce,
-        mac: Mac(payload.mac),
+        mac: Mac(payload.tag),
       );
-
-      final plaintext = await _algorithm.decrypt(
-        secretBox,
-        secretKey: secretKey,
+      final plain = await _algorithm.decrypt(
+        box,
+        secretKey: SecretKey(key),
         aad: associatedData ?? Uint8List(0),
       );
-
-      return Uint8List.fromList(plaintext);
+      return Uint8List.fromList(plain);
     } on SecretBoxAuthenticationError {
-      // Authentication failed — wrong key or tampered data
-      return null;
-    } on Object catch (e, st) {
-      throw CryptoException(
-        message: 'AES-256-GCM decryption failed',
-        cause: e,
+      throw const CryptoException(
+        message: 'MAC verification failed — wrong key or tampered data.',
       );
+    } on Object catch (e) {
+      throw CryptoException(message: 'Decryption failed: $e', cause: e);
     }
   }
 
-  /// Generates a cryptographically secure random nonce.
-  List<int> _generateNonce() {
-    final nonce = Uint8List(CryptoConstants.aesNonceLength);
-    for (var i = 0; i < nonce.length; i++) {
-      nonce[i] = _secureRandom.nextInt(256);
-    }
-    return nonce;
-  }
+  // ── Utilities ─────────────────────────────────────────────────────────
 
-  /// Generates [length] cryptographically secure random bytes.
   static Uint8List generateRandomBytes(int length) {
-    final bytes = Uint8List(length);
-    for (var i = 0; i < length; i++) {
-      bytes[i] = _secureRandom.nextInt(256);
-    }
-    return bytes;
+    final b = Uint8List(length);
+    for (var i = 0; i < length; i++) b[i] = _rng.nextInt(256);
+    return b;
   }
 
-  /// Constant-time comparison to prevent timing attacks.
+  /// Constant-time comparison — prevents timing side-channels.
   static bool constantTimeEquals(List<int> a, List<int> b) {
     if (a.length != b.length) return false;
-    var result = 0;
-    for (var i = 0; i < a.length; i++) {
-      result |= a[i] ^ b[i];
-    }
-    return result == 0;
+    var diff = 0;
+    for (var i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+    return diff == 0;
   }
 
-  /// Zeroes out a byte array to remove sensitive data from memory.
+  /// Overwrites [bytes] with zeros (best-effort memory zeroing).
   static void zeroMemory(Uint8List bytes) {
-    for (var i = 0; i < bytes.length; i++) {
-      bytes[i] = 0;
-    }
-  }
-}
-
-/// Immutable container for AES-GCM encrypted output.
-final class EncryptedPayload {
-  const EncryptedPayload({
-    required this.ciphertext,
-    required this.nonce,
-    required this.mac,
-  });
-
-  /// Factory to deserialize from a combined byte array.
-  /// Format: [nonce (12 bytes)] [mac (16 bytes)] [ciphertext (variable)]
-  factory EncryptedPayload.fromBytes(Uint8List bytes) {
-    if (bytes.length < CryptoConstants.aesNonceLength + CryptoConstants.aesTagLength) {
-      throw const CryptoException(message: 'Invalid encrypted payload length');
-    }
-
-    var offset = 0;
-    final nonce = bytes.sublist(offset, offset + CryptoConstants.aesNonceLength);
-    offset += CryptoConstants.aesNonceLength;
-
-    final mac = bytes.sublist(offset, offset + CryptoConstants.aesTagLength);
-    offset += CryptoConstants.aesTagLength;
-
-    final ciphertext = bytes.sublist(offset);
-
-    return EncryptedPayload(
-      ciphertext: ciphertext,
-      nonce: nonce,
-      mac: mac,
-    );
-  }
-
-  final Uint8List ciphertext;
-  final Uint8List nonce;
-  final Uint8List mac;
-
-  /// Serializes to combined byte array.
-  /// Format: [nonce (12 bytes)] [mac (16 bytes)] [ciphertext (variable)]
-  Uint8List toBytes() {
-    final result = Uint8List(
-      CryptoConstants.aesNonceLength + CryptoConstants.aesTagLength + ciphertext.length,
-    );
-    var offset = 0;
-
-    result.setRange(offset, offset + nonce.length, nonce);
-    offset += nonce.length;
-
-    result.setRange(offset, offset + mac.length, mac);
-    offset += mac.length;
-
-    result.setRange(offset, offset + ciphertext.length, ciphertext);
-
-    return result;
+    for (var i = 0; i < bytes.length; i++) bytes[i] = 0;
   }
 }
