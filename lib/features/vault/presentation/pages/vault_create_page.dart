@@ -1,19 +1,31 @@
+// lib/features/vault/presentation/pages/vault_create_page.dart
+// Form to create a new vault entry — title, category, credentials, notes, TOTP.
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
-import 'package:safira/core/security/password_generator.dart';
-import 'package:safira/features/vault/presentation/providers/vault_provider.dart';
-import 'package:safira/shared/widgets/safira_button.dart';
-import 'package:safira/shared/widgets/safira_text_field.dart';
 
-/// Page for creating a new vault entry.
-///
-/// Supports:
-/// - All standard fields (title, username, password, URL, notes)
-/// - Inline password generator
-/// - TOTP secret field
-/// - Category selection
-/// - Tags
+import '../../../../core/security/password_generator.dart';
+import '../../../../shared/widgets/safira_button.dart';
+import '../../../../shared/widgets/safira_text_field.dart';
+import '../providers/vault_provider.dart';
+
+// ─── Categories ───────────────────────────────────────────────────────────────
+
+const _kCategories = [
+  'Login',
+  'Email',
+  'Banking',
+  'Social',
+  'Work',
+  'Shopping',
+  'Crypto',
+  'Note',
+  'Other',
+];
+
+// ─── Page ─────────────────────────────────────────────────────────────────────
+
 class VaultCreatePage extends ConsumerStatefulWidget {
   const VaultCreatePage({super.key});
 
@@ -22,139 +34,264 @@ class VaultCreatePage extends ConsumerStatefulWidget {
 }
 
 class _VaultCreatePageState extends ConsumerState<VaultCreatePage> {
-  final _titleController = TextEditingController();
-  final _usernameController = TextEditingController();
-  final _passwordController = TextEditingController();
-  final _urlController = TextEditingController();
-  final _notesController = TextEditingController();
-  String _selectedCategory = 'Login';
-  bool _isLoading = false;
+  final _formKey = GlobalKey<FormState>();
 
-  static const _categories = ['Login', 'Card', 'Identity', 'Note', 'Other'];
+  // Controllers
+  final _titleCtrl = TextEditingController();
+  final _usernameCtrl = TextEditingController();
+  final _urlCtrl = TextEditingController();
+  final _passwordCtrl = TextEditingController();
+  final _notesCtrl = TextEditingController();
+  final _totpCtrl = TextEditingController();
+  final _tagsCtrl = TextEditingController();
+
+  String _category = _kCategories.first;
+  bool _showPassword = false;
+  bool _addTotp = false;
+  bool _isSaving = false;
 
   @override
   void dispose() {
-    _titleController.dispose();
-    _usernameController.dispose();
-    _passwordController.dispose();
-    _urlController.dispose();
-    _notesController.dispose();
+    _titleCtrl.dispose();
+    _usernameCtrl.dispose();
+    _urlCtrl.dispose();
+    _passwordCtrl.dispose();
+    _notesCtrl.dispose();
+    _totpCtrl.dispose();
+    _tagsCtrl.dispose();
     super.dispose();
   }
 
+  // ── Generate password ─────────────────────────────────────────────────
+
+  void _generatePassword() {
+    final pw = PasswordGenerator.generate(
+      length: 20,
+      uppercase: true,
+      lowercase: true,
+      digits: true,
+      symbols: true,
+    );
+    _passwordCtrl.text = pw;
+  }
+
+  // ── Save ─────────────────────────────────────────────────────────────
+
+  Future<void> _save() async {
+    if (!(_formKey.currentState?.validate() ?? false)) return;
+
+    setState(() => _isSaving = true);
+    try {
+      final tags = _tagsCtrl.text
+          .split(',')
+          .map((t) => t.trim())
+          .where((t) => t.isNotEmpty)
+          .toList();
+
+      await ref.read(vaultNotifierProvider.notifier).createEntry(
+            title: _titleCtrl.text.trim(),
+            category: _category,
+            username: _usernameCtrl.text.trim().isEmpty
+                ? null
+                : _usernameCtrl.text.trim(),
+            url:
+                _urlCtrl.text.trim().isEmpty ? null : _urlCtrl.text.trim(),
+            password: _passwordCtrl.text,
+            notes: _notesCtrl.text.trim().isEmpty
+                ? null
+                : _notesCtrl.text.trim(),
+            totpSecret:
+                _addTotp && _totpCtrl.text.trim().isNotEmpty
+                    ? _totpCtrl.text.trim()
+                    : null,
+            tags: tags,
+          );
+
+      if (mounted) context.pop();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to save: $e'),
+            backgroundColor: Theme.of(context).colorScheme.error,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isSaving = false);
+    }
+  }
+
+  // ── Build ─────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('New Entry'),
-        leading: IconButton(
-          icon: const Icon(Icons.close),
-          onPressed: () => context.pop(),
-        ),
+        centerTitle: false,
+        actions: [
+          TextButton(
+            onPressed: _isSaving ? null : _save,
+            child: _isSaving
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Text('Save'),
+          ),
+          const SizedBox(width: 8),
+        ],
       ),
-      body: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
+      body: Form(
+        key: _formKey,
+        child: ListView(
+          padding: const EdgeInsets.all(20),
+          children: [
+            // ── Title ──────────────────────────────────────────────
+            SafiraTextField(
+              controller: _titleCtrl,
+              label: 'Title',
+              hint: 'e.g. Google Account',
+              prefixIcon: Icons.title_rounded,
+              validator: (v) =>
+                  (v == null || v.trim().isEmpty) ? 'Title is required' : null,
+              textInputAction: TextInputAction.next,
+            ),
+            const SizedBox(height: 16),
+
+            // ── Category ───────────────────────────────────────────
+            Text('Category', style: tt.labelMedium),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: _kCategories.map((cat) {
+                final selected = _category == cat;
+                return ChoiceChip(
+                  label: Text(cat),
+                  selected: selected,
+                  onSelected: (_) => setState(() => _category = cat),
+                  selectedColor: cs.primaryContainer,
+                  labelStyle: TextStyle(
+                    color: selected
+                        ? cs.onPrimaryContainer
+                        : cs.onSurfaceVariant,
+                    fontWeight: selected
+                        ? FontWeight.w600
+                        : FontWeight.normal,
+                  ),
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 20),
+
+            // ── Username ───────────────────────────────────────────
+            SafiraTextField(
+              controller: _usernameCtrl,
+              label: 'Username / Email',
+              hint: 'optional',
+              prefixIcon: Icons.person_outline_rounded,
+              textInputAction: TextInputAction.next,
+            ),
+            const SizedBox(height: 16),
+
+            // ── URL ────────────────────────────────────────────────
+            SafiraTextField(
+              controller: _urlCtrl,
+              label: 'Website URL',
+              hint: 'https://example.com',
+              prefixIcon: Icons.link_rounded,
+              keyboardType: TextInputType.url,
+              textInputAction: TextInputAction.next,
+            ),
+            const SizedBox(height: 16),
+
+            // ── Password ───────────────────────────────────────────
+            SafiraTextField(
+              controller: _passwordCtrl,
+              label: 'Password',
+              prefixIcon: Icons.lock_outline_rounded,
+              obscureText: !_showPassword,
+              textInputAction: TextInputAction.next,
+              suffixIcon: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    icon: Icon(
+                      _showPassword
+                          ? Icons.visibility_off_rounded
+                          : Icons.visibility_rounded,
+                    ),
+                    tooltip: _showPassword ? 'Hide' : 'Show',
+                    onPressed: () =>
+                        setState(() => _showPassword = !_showPassword),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.auto_fix_high_rounded),
+                    tooltip: 'Generate password',
+                    onPressed: _generatePassword,
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+
+            // ── Notes ──────────────────────────────────────────────
+            SafiraTextField(
+              controller: _notesCtrl,
+              label: 'Notes',
+              hint: 'optional',
+              prefixIcon: Icons.notes_rounded,
+              maxLines: 3,
+              textInputAction: TextInputAction.newline,
+            ),
+            const SizedBox(height: 16),
+
+            // ── Tags ───────────────────────────────────────────────
+            SafiraTextField(
+              controller: _tagsCtrl,
+              label: 'Tags',
+              hint: 'work, personal, finance  (comma-separated)',
+              prefixIcon: Icons.label_outline_rounded,
+              textInputAction: TextInputAction.next,
+            ),
+            const SizedBox(height: 20),
+
+            // ── TOTP ───────────────────────────────────────────────
+            SwitchListTile(
+              value: _addTotp,
+              onChanged: (v) => setState(() => _addTotp = v),
+              title: const Text('Add TOTP (2FA)'),
+              subtitle: const Text('Paste your TOTP secret key'),
+              contentPadding: EdgeInsets.zero,
+            ),
+            if (_addTotp) ...[
+              const SizedBox(height: 8),
               SafiraTextField(
-                controller: _titleController,
-                label: 'Title',
-                hint: 'e.g. GitHub, Gmail',
-                prefixIcon: const Icon(Icons.label_outline),
-                showClearButton: true,
-              ),
-              const SizedBox(height: 16),
-
-              SafiraTextField(
-                controller: _usernameController,
-                label: 'Username / Email',
-                prefixIcon: const Icon(Icons.person_outline),
-                keyboardType: TextInputType.emailAddress,
-                showClearButton: true,
-                showCopyButton: true,
-              ),
-              const SizedBox(height: 16),
-
-              SafiraTextField(
-                controller: _passwordController,
-                label: 'Password',
-                isPassword: true,
-                showStrengthIndicator: true,
-                showCopyButton: true,
-                prefixIcon: const Icon(Icons.lock_outline),
-                suffixIcon: IconButton(
-                  icon: const Icon(Icons.auto_awesome_outlined),
-                  tooltip: 'Generate password',
-                  onPressed: _generatePassword,
-                ),
-              ),
-              const SizedBox(height: 16),
-
-              SafiraTextField(
-                controller: _urlController,
-                label: 'Website URL',
-                hint: 'https://example.com',
-                prefixIcon: const Icon(Icons.link_outlined),
-                keyboardType: TextInputType.url,
-              ),
-              const SizedBox(height: 16),
-
-              // Category
-              DropdownButtonFormField<String>(
-                value: _selectedCategory,
-                decoration: const InputDecoration(
-                  labelText: 'Category',
-                  prefixIcon: Icon(Icons.category_outlined),
-                  border: OutlineInputBorder(),
-                ),
-                items: _categories
-                    .map((c) => DropdownMenuItem(value: c, child: Text(c)))
-                    .toList(),
-                onChanged: (v) => setState(() => _selectedCategory = v!),
-              ),
-              const SizedBox(height: 16),
-
-              SafiraTextField(
-                controller: _notesController,
-                label: 'Notes',
-                hint: 'Secure notes for this entry…',
-                maxLines: 4,
-                prefixIcon: const Icon(Icons.notes_outlined),
-              ),
-              const SizedBox(height: 32),
-
-              SafiraButton(
-                label: 'Save Entry',
-                icon: Icons.save_outlined,
-                isLoading: _isLoading,
-                onPressed: _canSave() ? _save : null,
+                controller: _totpCtrl,
+                label: 'TOTP Secret',
+                hint: 'JBSWY3DPEHPK3PXP',
+                prefixIcon: Icons.qr_code_rounded,
+                textInputAction: TextInputAction.done,
               ),
             ],
-          ),
+            const SizedBox(height: 32),
+
+            // ── Save button ────────────────────────────────────────
+            SafiraButton(
+              label: 'Save Entry',
+              onPressed: _isSaving ? null : _save,
+              isLoading: _isSaving,
+            ),
+            const SizedBox(height: 16),
+          ],
         ),
       ),
     );
-  }
-
-  bool _canSave() => _titleController.text.isNotEmpty && !_isLoading;
-
-  void _generatePassword() {
-    final password = PasswordGenerator.instance.generate(
-      const PasswordOptions(length: 20),
-    );
-    _passwordController.text = password;
-  }
-
-  Future<void> _save() async {
-    setState(() => _isLoading = true);
-    try {
-      // TODO: Create VaultEntryModel, encrypt, save
-      await Future.delayed(const Duration(milliseconds: 500));
-      if (mounted) context.pop();
-    } on Exception {
-      setState(() => _isLoading = false);
-    }
   }
 }
